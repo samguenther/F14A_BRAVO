@@ -31,6 +31,21 @@ app.use(morgan(':method :url :status'));
 
 app.use(requestLogger);
 
+// Tracks whether startup data-seeding has finished. Score/ranking routes are
+// gated on this so a cold start (e.g. after Render's free-tier disk resets
+// or the instance spins down) never silently returns empty results while
+// seeding is still in progress — it returns a clear 503 instead.
+let dataReady = false;
+
+// Block score/ranking routes (not /health or /metrics) until seeding has
+// had a chance to run, instead of racing them against a cold start.
+app.use((req, res, next) => {
+  if (!dataReady && req.path.startsWith('/score')) {
+    return res.status(503).json({ error: 'Server is warming up, please retry shortly.' });
+  }
+  next();
+});
+
 const catchErrors = (fn) => async (req, res) => {
   try {
     await fn(req, res);
@@ -152,11 +167,7 @@ app.use(errorLogger);
 
 const PORT = process.env.PORT || 5005;
 
-const server = app.listen(PORT, async () => {
-  console.log(`Backend listening on port ${PORT}`);
-
-  if (process.env.NODE_ENV === 'test') return;
-
+const ensureSeeded = async () => {
   try {
     const locations = await getAllLocations();
     if (locations.length < 100) {
@@ -193,7 +204,22 @@ const server = app.listen(PORT, async () => {
     }
   } catch (err) {
     console.error('Auto-seed error:', err.message);
+  } finally {
+    // Even on failure, flip readiness so the API doesn't hang forever in a
+    // "warming up" state — routes will just reflect whatever data exists.
+    dataReady = true;
   }
+};
+
+const server = app.listen(PORT, async () => {
+  console.log(`Backend listening on port ${PORT}`);
+
+  if (process.env.NODE_ENV === 'test') {
+    dataReady = true;
+    return;
+  }
+
+  await ensureSeeded();
 });
 
 export default server;
